@@ -1,0 +1,262 @@
+# filepath: .github/workflows/daily_scrape.yml
+name: Daily Harvester
+
+on:
+  schedule:
+    - cron: "0 3 * * *"   # 03:00 UTC — first daily run
+  workflow_dispatch:
+    inputs:
+      chain_depth:
+        description: "Number of times this run has been chained (auto-managed)"
+        required: false
+        default: "0"
+
+concurrency:
+  group: daily-harvester
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  scrape:
+    # CRITICAL: Prevent running on your personal Dev repo to save minutes
+    if: github.repository == 'G2F-data/g2f-platform-harvester'
+
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        attempt: [1, 2, 3]
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+
+    outputs:
+      scraper_exit: ${{ steps.run_scraper.outputs.exit_code }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Poetry
+        run: pipx install poetry
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "poetry"
+
+      - name: Install dependencies
+        run: poetry install --no-interaction
+
+      - name: Install Playwright browsers
+        run: |
+          poetry run playwright install chromium
+          poetry run playwright install-deps
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: '${{ secrets.GCP_CREDENTIALS }}'
+
+      - name: Run Scraper
+        id: run_scraper
+        # IMPORTANT: continue-on-error so the chainer job can inspect exit code.
+        # With continue-on-error: true the job result is ALWAYS 'success' at the
+        # job level, so the chain condition must guard on scraper_exit value only.
+        # We do NOT re-exit with $CODE here — that would be redundant and
+        # would cause the step to be marked failed despite continue-on-error.
+        continue-on-error: true
+        env:
+          APP_ENV: cloud
+          GCS_RACECARD_BUCKET_NAME: ${{ secrets.GCS_RACECARD_BUCKET_NAME }}
+          # Google Auth Action sets GOOGLE_APPLICATION_CREDENTIALS automatically
+          SCRAPER_CONCURRENCY: 1
+          SCRAPER_TIME_BUDGET_SECONDS: "2700"
+        run: |
+          set +e
+          poetry run python apps/scraper_cloud/main.py
+          CODE=$?
+          set -e
+          echo "exit_code=$CODE" >> "$GITHUB_OUTPUT"
+
+      - name: Handle exit codes
+        run: |
+          EXIT_CODE="${{ steps.run_scraper.outputs.exit_code }}"
+          ATTEMPT="${{ matrix.attempt }}"
+          if [ "$EXIT_CODE" = "0" ]; then
+            echo "✅ All targets scraped successfully"
+          elif [ "$EXIT_CODE" = "11" ]; then
+            echo "⚠️ WAF block detected — attempt ${ATTEMPT}"
+            if [ "$ATTEMPT" = "3" ]; then
+              echo "❌ All attempts exhausted"
+              exit 1
+            fi
+            exit 11
+          elif [ "$EXIT_CODE" = "20" ]; then
+            echo "⏰ Time budget exceeded — will resume on next run"
+            exit 0
+          else
+            echo "❌ Unexpected exit code: ${EXIT_CODE}"
+            exit 1
+          fi
+
+  chain_if_pending:
+    needs: scrape
+    if: |
+      needs.scrape.result == 'success' &&
+      (
+        needs.scrape.outputs.scraper_exit == '20' ||
+        needs.scrape.outputs.scraper_exit == '11'
+      ) &&
+      fromJSON(github.event.inputs.chain_depth || '0') < 10
+    runs-on: ubuntu-latest
+    steps:
+      - name: Calculate next chain depth
+        id: calc
+        run: |
+          DEPTH="${{ github.event.inputs.chain_depth }}"
+          if [ -z "$DEPTH" ]; then DEPTH="0"; fi
+          echo "next_depth=$(( DEPTH + 1 ))" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger next scraper run
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.ACTION_PAT }}
+          script: |
+            await new Promise(r => setTimeout(r, 15000));
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'daily_scrape.yml',
+              ref: 'main',
+              inputs: {
+                chain_depth: '${{ steps.calc.outputs.next_depth }}',
+              },
+            });
+            console.log(
+              'Chained run ${{ steps.calc.outputs.next_depth }} triggered.'
+            );
+
+  notify:
+    needs: scrape
+    if: |
+      always() &&
+      !(
+        (
+          needs.scrape.outputs.scraper_exit == '20' ||
+          needs.scrape.outputs.scraper_exit == '11'
+        ) &&
+        fromJSON(github.event.inputs.chain_depth || '0') < 10
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: '${{ secrets.GCP_CREDENTIALS }}'
+
+      - name: Set up gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build and send Telegram notification
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GCS_RACECARD_BUCKET_NAME: ${{ secrets.GCS_RACECARD_BUCKET_NAME }}
+          EXIT_CODE: ${{ needs.scrape.outputs.scraper_exit }}
+          CHAIN_DEPTH: ${{ github.event.inputs.chain_depth || '0' }}
+          RUN_URL: >-
+            https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          DATE=$(date -u +%Y-%m-%d)
+          MANIFEST_PATH="gs://${GCS_RACECARD_BUCKET_NAME}/${DATE}/_manifest.json"
+
+          TOTAL=0; SUCCESS=0; FAILED=0; RETRIED=0
+          DURATION_SECS=0; STATUS="unknown"; GHOST=0; PARTIAL=0
+
+          if gsutil -q stat "$MANIFEST_PATH" 2>/dev/null; then
+            gsutil cp "$MANIFEST_PATH" /tmp/manifest.json 2>/dev/null
+            TOTAL=$(jq '[.targets | length][0]' /tmp/manifest.json)
+            SUCCESS=$(jq \
+              '[.targets[] | select(.status=="SUCCESS")] | length' \
+              /tmp/manifest.json)
+            FAILED=$(jq \
+              '[.targets[] | select(.status=="FAILED")] | length' \
+              /tmp/manifest.json)
+            RETRIED=$(jq \
+              '[.targets[] | select(.retries > 0)] | length' \
+              /tmp/manifest.json)
+            DURATION_SECS=$(jq '.duration_seconds // 0' /tmp/manifest.json)
+            STATUS=$(jq -r '.status // "unknown"' /tmp/manifest.json)
+            GHOST=$(jq \
+              '[.targets[] | select(.status=="FAILED") |
+                select(.error_log // "" | test("^GHOST"))] | length' \
+              /tmp/manifest.json)
+            PARTIAL=$(jq \
+              '[.targets[] |
+                select(.error_log // "" | test("^PARTIAL"))] | length' \
+              /tmp/manifest.json)
+          fi
+
+          TOTAL_MINS=$(( ${DURATION_SECS%.*} / 60 ))
+          HOURS=$(( TOTAL_MINS / 60 ))
+          MINS=$(( TOTAL_MINS % 60 ))
+          if [ "$HOURS" -gt 0 ]; then
+            DURATION_STR="${HOURS}h ${MINS}m"
+          else
+            DURATION_STR="${MINS}m"
+          fi
+
+          RUNS=$(( CHAIN_DEPTH + 1 ))
+
+          case "$STATUS" in
+            completed)              HEADER="✅ Harvest complete" ;;
+            completed_with_errors)  HEADER="⚠️ Harvest done with errors" ;;
+            running)                HEADER="🔁 Chain limit reached (10 runs)" ;;
+            *)                      HEADER="💥 Harvester crashed" ;;
+          esac
+
+          if [ "$RETRIED" -gt 0 ]; then
+            RETRY_LINE="🔄 ${RETRIED} target(s) needed a retry"
+          else
+            RETRY_LINE="🔄 No retries needed"
+          fi
+
+          if [ "$TOTAL" -gt 0 ]; then
+            QUALITY_PCT=$(( SUCCESS * 100 / TOTAL ))
+          else
+            QUALITY_PCT=100
+          fi
+
+          if [ "$SUCCESS" -eq "$TOTAL" ] && [ "$PARTIAL" -eq 0 ]; then
+            QUALITY_LINE="📊 Quality: 100% — all races clean"
+          else
+            QUALITY_LINE="⚠️ Quality: ${QUALITY_PCT}% — ${GHOST} ghost races, ${PARTIAL} partial failures"
+          fi
+
+          MSG=$(printf '%s — %s\n\n📋 %s races   ✅ %s saved   ❌ %s failed\n⏱ %s across %s run(s)\n%s\n%s\n\n🔗 %s' \
+            "$HEADER" "$DATE" "$TOTAL" "$SUCCESS" "$FAILED" \
+            "$DURATION_STR" "$RUNS" "$RETRY_LINE" "$QUALITY_LINE" "$RUN_URL")
+
+          HTTP_STATUS=$(curl -s \
+            -o /tmp/tg_response.json \
+            -w "%{http_code}" \
+            -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"chat_id\": \"${TELEGRAM_CHAT_ID}\",
+              \"text\": $(echo "$MSG" | python3 -c \
+                'import json,sys; print(json.dumps(sys.stdin.read()))'),
+              \"disable_web_page_preview\": true
+            }")
+
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "Telegram notification sent."
+          else
+            echo "Telegram send failed (HTTP ${HTTP_STATUS}):"
+            cat /tmp/tg_response.json
+          fi

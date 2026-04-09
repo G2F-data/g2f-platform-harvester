@@ -1,0 +1,268 @@
+# filepath: .github/workflows/daily_results_scrape.yml
+name: Daily Results Scrape
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      chain_depth:
+        description: "Number of times this run has been chained (auto-managed)"
+        required: false
+        default: "0"
+      target_date:
+        description: "Single date to scrape (YYYY-MM-DD). Default: yesterday"
+        required: false
+        type: string
+      from_date:
+        description: "Start date for range backfill (YYYY-MM-DD)"
+        required: false
+        type: string
+      to_date:
+        description: "End date for range backfill (YYYY-MM-DD)"
+        required: false
+        type: string
+
+env:
+  GCS_RESULTS_BUCKET_NAME: ${{ secrets.GCS_RESULTS_BUCKET_NAME }}
+
+concurrency:
+  group: results-harvester
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  scrape:
+    if: github.repository == 'G2F-data/g2f-platform-harvester'
+
+    # Matrix retries mirror daily_scrape.yml.
+    # On WAF block (exit 11) attempt 1 exits 11, fail-fast: false keeps
+    # attempts 2 and 3 queued on fresh runners with new IPs.
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        attempt: [1, 2, 3]
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+
+    outputs:
+      scraper_exit: ${{ steps.run_scraper.outputs.exit_code }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Poetry
+        run: pipx install poetry
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "poetry"
+
+      - name: Install dependencies
+        run: poetry install --no-interaction
+
+      - name: Install Playwright browsers
+        run: |
+          poetry run playwright install chromium
+          poetry run playwright install-deps
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: '${{ secrets.GCP_CREDENTIALS }}'
+
+      - name: Run Results Scraper
+        id: run_scraper
+        continue-on-error: true
+        env:
+          APP_ENV: cloud
+          GCS_RESULTS_BUCKET_NAME: ${{ secrets.GCS_RESULTS_BUCKET_NAME }}
+          SCRAPER_CONCURRENCY: 1
+          SCRAPER_TIME_BUDGET_SECONDS: "2700"
+          TARGET_DATE: ${{ inputs.target_date }}
+          FROM_DATE: ${{ inputs.from_date }}
+          TO_DATE: ${{ inputs.to_date }}
+        run: |
+          set +e
+          poetry run python apps/g2f_results_harvester/results_main.py
+          CODE=$?
+          set -e
+          echo "exit_code=$CODE" >> "$GITHUB_OUTPUT"
+
+      - name: Handle exit codes
+        run: |
+          CODE="${{ steps.run_scraper.outputs.exit_code }}"
+          ATTEMPT="${{ matrix.attempt }}"
+          if [ "$CODE" = "0" ]; then
+            echo "✅ All results scraped (attempt ${ATTEMPT})"
+          elif [ "$CODE" = "11" ]; then
+            echo "⚠️ IP blocked (exit 11) — attempt ${ATTEMPT}/3"
+            if [ "$ATTEMPT" = "3" ]; then
+              echo "❌ All 3 attempts exhausted on IP block"
+              exit 1
+            fi
+            exit 11
+          elif [ "$CODE" = "20" ]; then
+            echo "⏰ Budget exhausted — will chain next run"
+            exit 0
+          elif [ "$CODE" = "1" ]; then
+            echo "💥 Scraper crashed (exit 1)"
+            exit 1
+          else
+            echo "❌ Unexpected exit code: ${CODE}"
+            exit 1
+          fi
+
+  # Public repo = no Actions minute limits.
+  # Chain limit raised to 20 (covers large backfill ranges).
+  # For multi-month backfills trigger manually and monitor depth in logs.
+  chain_if_pending:
+    needs: scrape
+    if: |
+      needs.scrape.result == 'success' &&
+      (
+        needs.scrape.outputs.scraper_exit == '20' ||
+        needs.scrape.outputs.scraper_exit == '11'
+      ) &&
+      fromJSON(github.event.inputs.chain_depth || '0') < 20
+    runs-on: ubuntu-latest
+    steps:
+      - name: Calculate next chain depth
+        id: calc
+        run: |
+          DEPTH="${{ github.event.inputs.chain_depth }}"
+          if [ -z "$DEPTH" ]; then DEPTH="0"; fi
+          echo "next_depth=$(( DEPTH + 1 ))" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger next results run
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.ACTION_PAT }}
+          script: |
+            await new Promise(r => setTimeout(r, 15000));
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'daily_results_scrape.yml',
+              ref: 'main',
+              inputs: {
+                chain_depth: '${{ steps.calc.outputs.next_depth }}',
+                target_date: '${{ github.event.inputs.target_date }}',
+                from_date: '${{ github.event.inputs.from_date }}',
+                to_date: '${{ github.event.inputs.to_date }}'
+              },
+            });
+            console.log(
+              'Chained results run ${{ steps.calc.outputs.next_depth }} triggered.'
+            );
+
+  notify:
+    needs: scrape
+    if: |
+      always() &&
+      !(
+        (
+          needs.scrape.outputs.scraper_exit == '20' ||
+          needs.scrape.outputs.scraper_exit == '11'
+        ) &&
+        fromJSON(github.event.inputs.chain_depth || '0') < 20
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: '${{ secrets.GCP_CREDENTIALS }}'
+
+      - name: Set up gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build and send Telegram notification
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GCS_RESULTS_BUCKET_NAME: ${{ secrets.GCS_RESULTS_BUCKET_NAME }}
+          EXIT_CODE: ${{ needs.scrape.outputs.scraper_exit }}
+          CHAIN_DEPTH: ${{ github.event.inputs.chain_depth || '0' }}
+          RUN_URL: >-
+            https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          DATE="${{ inputs.target_date || inputs.to_date || inputs.from_date }}"
+          if [ -z "$DATE" ]; then DATE=$(date -u -d 'yesterday' +%Y-%m-%d); fi
+
+          MANIFEST_PATH="gs://${GCS_RESULTS_BUCKET_NAME}/${DATE}/_manifest.json"
+
+          TOTAL=0; SCRAPED=0; FAILED=0; VOID=0; PENDING=0
+
+          if gsutil -q stat "$MANIFEST_PATH" 2>/dev/null; then
+            gsutil cp "$MANIFEST_PATH" /tmp/manifest.json 2>/dev/null
+            TOTAL=$(jq 'length' /tmp/manifest.json)
+            SCRAPED=$(jq \
+              '[to_entries[] | select(.value.status == "scraped")] | length' \
+              /tmp/manifest.json)
+            FAILED=$(jq \
+              '[to_entries[] | select(.value.status == "failed")] | length' \
+              /tmp/manifest.json)
+            VOID=$(jq \
+              '[to_entries[] | select(.value.status == "void")] | length' \
+              /tmp/manifest.json)
+            PENDING=$(jq \
+              '[to_entries[] | select(.value.status == "pending")] | length' \
+              /tmp/manifest.json 2>/dev/null || echo "0")
+          fi
+
+          RUNS=$(( CHAIN_DEPTH + 1 ))
+
+          if [ "$EXIT_CODE" = "0" ] && [ "$FAILED" -eq 0 ]; then
+            HEADER="✅ Results complete"
+          elif [ "$EXIT_CODE" = "0" ]; then
+            HEADER="⚠️ Results done with errors"
+          elif [ "$EXIT_CODE" = "1" ]; then
+            HEADER="💥 Results harvester crashed"
+          else
+            HEADER="🔁 Results chain limit reached (20 runs)"
+          fi
+
+          if [ "$TOTAL" -gt 0 ]; then
+            QUALITY_PCT=$(( SCRAPED * 100 / TOTAL ))
+          else
+            QUALITY_PCT=100
+          fi
+
+          if [ "$SCRAPED" -eq "$TOTAL" ] && [ "$TOTAL" -gt 0 ]; then
+            QUALITY_LINE="📊 Quality: 100% — all results captured"
+          else
+            QUALITY_LINE="⚠️ Quality: ${QUALITY_PCT}% — ${FAILED} failed, ${VOID} void, ${PENDING} pending"
+          fi
+
+          MSG=$(printf '%s — %s\n\n📋 %s races   ✅ %s scraped   ❌ %s failed   ⬜ %s void\n⏱ %s run(s)\n%s\n\n🔗 %s' \
+            "$HEADER" "$DATE" "$TOTAL" "$SCRAPED" "$FAILED" \
+            "$VOID" "$RUNS" "$QUALITY_LINE" "$RUN_URL")
+
+          HTTP_STATUS=$(curl -s \
+            -o /tmp/tg_response.json \
+            -w "%{http_code}" \
+            -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"chat_id\": \"${TELEGRAM_CHAT_ID}\",
+              \"text\": $(echo "$MSG" | python3 -c \
+                'import json,sys; print(json.dumps(sys.stdin.read()))'),
+              \"disable_web_page_preview\": true
+            }")
+
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "Telegram notification sent."
+          else
+            echo "Telegram send failed (HTTP ${HTTP_STATUS}):"
+            cat /tmp/tg_response.json
+          fi
